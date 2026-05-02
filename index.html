@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Neder — Learn Dutch</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,7 +14,7 @@
 <div id="container" style="display:none">
   <h1 id="title"></h1>
   <div id="story"></div>
-  <button id="done-btn">Next story</button>
+  <button id="done-btn" disabled>Read the story</button>
   <a href="#" id="vocab-btn">My vocabulary</a>
   <div id="vocab-list" style="display:none"></div>
 </div>
@@ -391,6 +392,11 @@ The "meanings" object must contain English translations ONLY for words that are 
     return story;
   }
 
+  function setDoneEnabled(enabled) {
+    $done.disabled = !enabled;
+    $done.textContent = enabled ? "Next story" : "Read the story";
+  }
+
   function showStory(story) {
     renderStory(story);
     $loading.style.display = "none";
@@ -398,19 +404,19 @@ The "meanings" object must contain English translations ONLY for words that are 
   }
 
   function prefetchNextStory() {
-    $done.disabled = true;
+    setDoneEnabled(false);
     nextStoryPromise = callGemini(buildPrompt())
       .then(validateStory)
       .then(story => {
         progress.nextStory = story;
         saveProgress(progress);
-        $done.disabled = false;
+        setDoneEnabled(true);
         return story;
       })
       .catch(err => {
         // Prefetch failed — allow retry via Done button
         console.log("Prefetch failed:", err);
-        $done.disabled = false;
+        setDoneEnabled(true);
         nextStoryPromise = null;
       });
   }
@@ -422,7 +428,7 @@ The "meanings" object must contain English translations ONLY for words that are 
       if (!progress.nextStory) {
         prefetchNextStory();
       } else {
-        $done.disabled = false;
+        setDoneEnabled(true);
       }
       return;
     }
