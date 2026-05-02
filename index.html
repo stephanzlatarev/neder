@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neder — Learn Dutch</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="error" style="display:none"></div>
+<div id="loading" style="display:none"><span class="spinner"></span> Generating story…</div>
+<div id="container" style="display:none">
+  <h1 id="title"></h1>
+  <div id="story"></div>
+  <button id="done-btn">Next story</button>
+  <a href="#" id="vocab-btn">My vocabulary</a>
+  <div id="vocab-list" style="display:none"></div>
+</div>
+
+<div class="bubble" id="bubble" style="display:none"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ── Config ── */
+  const STORAGE_KEY = "progress";
+  const GEMINI_MODEL = "gemini-flash-latest";
+
+  /* ── DOM refs ── */
+  const $error     = document.getElementById("error");
+  const $loading   = document.getElementById("loading");
+  const $container = document.getElementById("container");
+  const $title     = document.getElementById("title");
+  const $story     = document.getElementById("story");
+  const $done      = document.getElementById("done-btn");
+  const $vocabBtn  = document.getElementById("vocab-btn");
+  const $vocabList = document.getElementById("vocab-list");
+  const $bubble    = document.getElementById("bubble");
+
+  /* ── API key from fragment ── */
+  const apiKey = location.hash.slice(1);
+  if (!apiKey) {
+    showError("No API key found.<br>Add your Gemini API key to the URL:<br><code>…/#YOUR_KEY</code>");
+    return;
+  }
+
+  /* ── Progress persistence ── */
+  function loadProgress() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch (_) {}
+    return { vocabulary: {} };
+  }
+
+  function saveProgress(progress) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(progress));
+  }
+
+  /* ── State ── */
+  let progress = loadProgress();
+  let sessionTaps = {};       // word -> true (track unique taps per session)
+  let currentWords = [];      // [{raw, lower, isNew}]
+  let currentMeanings = {};   // lower -> meaning
+  let activeBubbleWord = null;
+
+  /* ── Helpers ── */
+  function showError(msg) {
+    $error.innerHTML = msg;
+    $error.style.display = "block";
+    $loading.style.display = "none";
+    $container.style.display = "none";
+  }
+
+  function stripPunctuation(w) {
+    return w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+  }
+
+  /* ── Build the LLM prompt ── */
+  function buildPrompt() {
+    const vocab = progress.vocabulary;
+    const entries = Object.entries(vocab);
+
+    // Classify known words
+    const wellKnown = [];
+    const weak = [];
+    entries.forEach(([word, data]) => {
+      const tapRate = data.impressions > 0 ? data.taps / data.impressions : 1;
+      if (data.impressions >= 3 && tapRate <= 0.3) {
+        wellKnown.push({ word, ...data, tapRate });
+      } else {
+        weak.push({ word, ...data, tapRate });
+      }
+    });
+
+    // Sort by frequency descending for relevance
+    wellKnown.sort((a, b) => b.frequency - a.frequency);
+    weak.sort((a, b) => b.frequency - a.frequency);
+
+    const isFirstStory = entries.length === 0;
+
+    let knowledgeSection;
+    if (isFirstStory) {
+      knowledgeSection = `This is the user's FIRST story. They know no Dutch words yet.
+Use only simple, high-frequency everyday Dutch words (A1 level).
+Introduce around 8-10 new simple words.`;
+    } else {
+      knowledgeSection = `The user's vocabulary data (JSON):
+Well-known words (use freely, ~80% of story words): ${JSON.stringify(wellKnown.slice(0, 150).map(w => w.word))}
+Weak words (include some for reinforcement, ~15%): ${JSON.stringify(weak.slice(0, 50).map(w => w.word))}
+Total known words: ${entries.length}
+
+The story MUST also introduce new Dutch words the user hasn't seen. Target roughly:
+- 80% well-known words
+- 15% weak/reinforcement words
+- 5% brand-new words (max 10 new words)`;
+    }
+
+    return `You are a Dutch language tutor. Generate a SHORT story in Dutch (max 200 words) to help a learner improve their vocabulary.
+
+${knowledgeSection}
+
+STRICT RULES:
+1. The Dutch text MUST be grammatically correct.
+2. The story must be meaningful, coherent, and engaging — no nonsensical content.
+3. Keep it simple and natural.
+4. Maximum 200 words for the story text.
+5. Distribute new and weak words EVENLY throughout the entire story. Do NOT cluster them at the beginning or end. Each sentence should mix well-known, weak, and new words naturally.
+
+Respond ONLY with a valid JSON object (no markdown, no code fences) in this exact format:
+{
+  "title": "<story title in Dutch>",
+  "text": "<story text in Dutch>",
+  "meanings": {
+    "<dutch word lowercase>": "<English meaning>",
+    ...
+  }
+}
+
+IMPORTANT: The story text MUST be complete — always end with a proper final sentence. Never leave a sentence unfinished.
+
+The "meanings" object must contain English translations ONLY for words that are NOT in the user's known vocabulary above. The user already knows the meanings of their known words. Include meanings for all new words and any common words (like "de", "het", "een") only if they are not in the known vocabulary.`;
+  }
+
+  /* ── Call Gemini API ── */
+  async function callGemini(prompt) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+    const body = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.9,
+        responseMimeType: "application/json"
+      }
+    };
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`Gemini API error ${res.status}: ${detail}`);
+    }
+
+    const data = await res.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error("Empty response from Gemini");
+
+    return parseLLMJson(text);
+  }
+
+  /* ── Robust JSON parsing for LLM output ── */
+  function parseLLMJson(raw) {
+    // Strip markdown code fences if present
+    let text = raw.trim();
+    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+
+    // Attempt direct parse first
+    try { return JSON.parse(text); } catch (_) {}
+
+    // Try to extract a JSON object substring
+    const objStart = text.indexOf("{");
+    if (objStart >= 0) {
+      let candidate = text.slice(objStart);
+      try { return JSON.parse(candidate); } catch (_) {}
+
+      // Attempt to fix truncated JSON: close open strings and braces
+      candidate = repairJson(candidate);
+      try { return JSON.parse(candidate); } catch (_) {}
+    }
+
+    // All attempts failed — log for troubleshooting and throw
+    console.log("Failed to parse LLM response. Raw text:", raw);
+    throw new Error("Could not parse the story from the LLM. Check the browser console for raw output.");
+  }
+
+  function repairJson(text) {
+    let s = text;
+
+    // Fix unterminated strings: if odd number of unescaped quotes, close the last one
+    let inString = false;
+    let lastQuoteIdx = -1;
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === "\\" && inString) { i++; continue; }
+      if (s[i] === '"') {
+        inString = !inString;
+        lastQuoteIdx = i;
+      }
+    }
+    if (inString) {
+      // String was left open — close it
+      s += '"';
+    }
+
+    // Close any unclosed braces / brackets
+    const stack = [];
+    inString = false;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === "\\" && inString) { i++; continue; }
+      if (c === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (c === "{") stack.push("}");
+      else if (c === "[") stack.push("]");
+      else if (c === "}" || c === "]") stack.pop();
+    }
+
+    // Remove any trailing comma before we close
+    s = s.replace(/,\s*$/, "");
+
+    // Append missing closing characters
+    while (stack.length) s += stack.pop();
+
+    return s;
+  }
+
+  /* ── Render a story ── */
+  function renderStory(story) {
+    $title.textContent = story.title;
+    currentMeanings = {};
+    // Fill in meanings from LLM response
+    for (const [k, v] of Object.entries(story.meanings)) {
+      currentMeanings[k.toLowerCase()] = v;
+    }
+    // Fill in known word meanings from progress (LLM no longer sends these)
+    for (const [word, data] of Object.entries(progress.vocabulary)) {
+      if (!currentMeanings[word] && data.meaning) {
+        currentMeanings[word] = data.meaning;
+      }
+    }
+
+    sessionTaps = {};
+    activeBubbleWord = null;
+    $bubble.style.display = "none";
+
+    // Determine which words are new
+    const knownSet = new Set(Object.keys(progress.vocabulary));
+
+    // Tokenise the full text (title + text)
+    const fullText = story.title + "\n" + story.text;
+
+    $story.innerHTML = "";
+    currentWords = [];
+
+    // Split into lines, then tokens
+    const lines = story.text.split("\n");
+    lines.forEach((line, li) => {
+      // Split keeping whitespace and punctuation attached
+      const tokens = line.split(/(\s+)/);
+      tokens.forEach(token => {
+        if (/^\s+$/.test(token)) {
+          $story.appendChild(document.createTextNode(token));
+          return;
+        }
+        const lower = stripPunctuation(token).toLowerCase();
+        if (!lower) {
+          $story.appendChild(document.createTextNode(token));
+          return;
+        }
+        const isNew = !knownSet.has(lower) && !progress.vocabulary[lower];
+
+        const span = document.createElement("span");
+        span.className = "word" + (isNew ? " new-word" : "");
+        span.textContent = token;
+        span.dataset.word = lower;
+        span.addEventListener("click", onWordTap);
+        $story.appendChild(span);
+
+        currentWords.push({ raw: token, lower, isNew });
+      });
+      if (li < lines.length - 1) {
+        $story.appendChild(document.createElement("br"));
+      }
+    });
+  }
+
+  /* ── Word tap handler ── */
+  function onWordTap(e) {
+    const span = e.currentTarget;
+    const word = span.dataset.word;
+
+    // Toggle bubble
+    if (activeBubbleWord === word) {
+      $bubble.style.display = "none";
+      activeBubbleWord = null;
+      return;
+    }
+
+    const meaning = currentMeanings[word];
+    if (!meaning) {
+      $bubble.style.display = "none";
+      activeBubbleWord = null;
+      return;
+    }
+
+    activeBubbleWord = word;
+    $bubble.textContent = meaning;
+    $bubble.style.display = "block";
+
+    // Position the bubble near the word
+    const rect = span.getBoundingClientRect();
+    let top = rect.top - $bubble.offsetHeight - 8;
+    let left = rect.left + rect.width / 2 - $bubble.offsetWidth / 2;
+    if (top < 4) top = rect.bottom + 8;
+    if (left < 4) left = 4;
+    if (left + $bubble.offsetWidth > window.innerWidth - 4) {
+      left = window.innerWidth - $bubble.offsetWidth - 4;
+    }
+    $bubble.style.top = top + "px";
+    $bubble.style.left = left + "px";
+
+    // Record tap (unique per session)
+    if (!sessionTaps[word]) {
+      sessionTaps[word] = true;
+    }
+  }
+
+  /* ── Close bubble on outside click ── */
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".word") && !e.target.closest(".bubble")) {
+      $bubble.style.display = "none";
+      activeBubbleWord = null;
+    }
+  });
+
+  /* ── Update progress on "Done" ── */
+  function updateProgress() {
+    const vocab = progress.vocabulary;
+
+    // Collect all words shown in this story
+    const shownWords = new Set(currentWords.map(w => w.lower));
+
+    for (const word of shownWords) {
+      if (!vocab[word]) {
+        // Estimate frequency: new words introduced by LLM
+        // We don't know exact frequency, so we start with a default
+        vocab[word] = {
+          frequency: 0.5,
+          impressions: 0,
+          taps: 0,
+          meaning: currentMeanings[word] || ""
+        };
+      }
+      vocab[word].impressions += 1;
+      if (sessionTaps[word]) {
+        vocab[word].taps += 1;
+      }
+      // Update meaning if we got a fresh one
+      if (currentMeanings[word]) {
+        vocab[word].meaning = currentMeanings[word];
+      }
+    }
+
+    saveProgress(progress);
+  }
+
+  /* ── Main flow ── */
+  let nextStoryPromise = null;
+
+  function validateStory(story) {
+    if (!story.title || !story.text) {
+      throw new Error("Invalid story format from LLM");
+    }
+    if (!story.meanings || typeof story.meanings !== "object") {
+      story.meanings = {};
+    }
+    return story;
+  }
+
+  function showStory(story) {
+    renderStory(story);
+    $loading.style.display = "none";
+    $container.style.display = "block";
+  }
+
+  function prefetchNextStory() {
+    $done.disabled = true;
+    nextStoryPromise = callGemini(buildPrompt())
+      .then(validateStory)
+      .then(story => {
+        progress.nextStory = story;
+        saveProgress(progress);
+        $done.disabled = false;
+        return story;
+      })
+      .catch(err => {
+        // Prefetch failed — allow retry via Done button
+        console.log("Prefetch failed:", err);
+        $done.disabled = false;
+        nextStoryPromise = null;
+      });
+  }
+
+  async function initialize() {
+    // If we have a current story saved, show it immediately and prefetch next
+    if (progress.currentStory) {
+      showStory(progress.currentStory);
+      if (!progress.nextStory) {
+        prefetchNextStory();
+      } else {
+        $done.disabled = false;
+      }
+      return;
+    }
+
+    // No current story — need to generate the first one
+    $container.style.display = "none";
+    $loading.style.display = "block";
+    $bubble.style.display = "none";
+    activeBubbleWord = null;
+
+    try {
+      const story = validateStory(await callGemini(buildPrompt()));
+      progress.currentStory = story;
+      saveProgress(progress);
+      showStory(story);
+      prefetchNextStory();
+    } catch (err) {
+      showError("Something went wrong:<br>" + escapeHtml(err.message));
+    }
+  }
+
+  function escapeHtml(s) {
+    const d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  /* ── Done button ── */
+  $done.addEventListener("click", async () => {
+    updateProgress();
+
+    if (progress.nextStory) {
+      // Use prefetched story
+      progress.currentStory = progress.nextStory;
+      progress.nextStory = null;
+      saveProgress(progress);
+      showStory(progress.currentStory);
+      prefetchNextStory();
+    } else if (nextStoryPromise) {
+      // Prefetch in progress — wait for it
+      $container.style.display = "none";
+      $loading.style.display = "block";
+      try {
+        const story = await nextStoryPromise;
+        if (story) {
+          progress.currentStory = story;
+          progress.nextStory = null;
+          saveProgress(progress);
+          showStory(progress.currentStory);
+          prefetchNextStory();
+        } else {
+          // Prefetch had failed, generate fresh
+          await initialize();
+        }
+      } catch (err) {
+        showError("Something went wrong:<br>" + escapeHtml(err.message));
+      }
+    } else {
+      // No prefetch at all — generate fresh
+      progress.currentStory = null;
+      progress.nextStory = null;
+      saveProgress(progress);
+      await initialize();
+    }
+  });
+
+  /* ── Vocabulary toggle ── */
+  $vocabBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    if ($vocabList.style.display !== "none") {
+      $vocabList.style.display = "none";
+      return;
+    }
+    const vocab = progress.vocabulary;
+    const words = Object.entries(vocab).sort((a, b) => a[0].localeCompare(b[0]));
+    if (words.length === 0) {
+      $vocabList.innerHTML = "<p class='vocab-empty'>No words learned yet.</p>";
+    } else {
+      const rows = words.map(([word, data]) => {
+        const tapRate = data.impressions > 0 ? data.taps / data.impressions : 1;
+        let flag, flagClass;
+        if (data.impressions >= 3 && tapRate <= 0.3) {
+          flag = "Strong"; flagClass = "flag-strong";
+        } else if (data.impressions >= 1) {
+          flag = "Weak"; flagClass = "flag-weak";
+        } else {
+          flag = "New"; flagClass = "flag-new";
+        }
+        return `<tr><td class="vocab-word">${escapeHtml(word)}</td><td><span class="vocab-flag ${flagClass}">${flag}</span></td><td class="vocab-meaning">${escapeHtml(data.meaning || "")}</td></tr>`;
+      }).join("");
+      $vocabList.innerHTML = `<table class="vocab-table"><thead><tr><th>Word</th><th>Status</th><th>Meaning</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+    $vocabList.style.display = "block";
+  });
+
+  /* ── Start ── */
+  initialize();
+})();
+</script>
+</body>
+</html>
